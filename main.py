@@ -1,5 +1,5 @@
-# main.py COMPLETO - TradeLog Analyzer API
-# Retorna regras estruturadas para automação
+# main.py COMPLETO - TradeLog Analyzer API v2
+# Uma entrada por vez + combinação de múltiplos indicadores
 
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,7 +9,6 @@ import json
 import re
 from datetime import datetime
 from typing import List, Dict, Optional
-import io
 
 app = FastAPI(title="TradeLog Analyzer API")
 
@@ -29,19 +28,14 @@ class TradeAnalyzer:
 
     def parse_json_file(self, content: str) -> List[dict]:
         content = re.sub(r'(?<=[\d])(,)(?=[\d])', '.', content)
-
-        # Try as JSON array first
         try:
             parsed = json.loads(content)
             if isinstance(parsed, list):
-                print(f"Parsed as JSON array: {len(parsed)} items")
                 return parsed
-            else:
-                return [parsed]
+            return [parsed]
         except json.JSONDecodeError:
             pass
 
-        # Split by double newline
         lines = content.strip().split('\n\n')
         data_list = []
         for line in lines:
@@ -53,11 +47,9 @@ class TradeAnalyzer:
                         data_list.extend(parsed)
                     else:
                         data_list.append(parsed)
-                except json.JSONDecodeError as e:
-                    print(f"Erro ao parsear linha: {e}")
+                except:
                     continue
 
-        # Try line by line
         if not data_list:
             for line in content.strip().split('\n'):
                 line = line.strip()
@@ -67,13 +59,11 @@ class TradeAnalyzer:
                     except:
                         continue
 
-        print(f"Total de objetos JSON parseados: {len(data_list)}")
         return data_list
 
     def convert_to_dataframe(self, data_list: List[dict]) -> pd.DataFrame:
         records = []
-
-        for i, item in enumerate(data_list):
+        for item in data_list:
             try:
                 timestamp_str = item.get('timestamp_barra') or item.get('timestamp')
                 if not timestamp_str:
@@ -136,9 +126,7 @@ class TradeAnalyzer:
                     record['pivot_range'] = 'Daily'
 
                 records.append(record)
-
             except Exception as e:
-                print(f"Erro ao processar item {i}: {e}")
                 continue
 
         if not records:
@@ -148,15 +136,9 @@ class TradeAnalyzer:
         df = df.sort_values('timestamp').reset_index(drop=True)
         df['hora'] = df['timestamp'].dt.hour
         df['minuto'] = df['timestamp'].dt.minute
-
-        print(f"DataFrame criado com {len(df)} linhas")
-        print(f"Colunas: {list(df.columns)}")
-        print(f"Período: {df['timestamp'].min()} a {df['timestamp'].max()}")
-
         return df
 
-    def simulate_trade(self, df: pd.DataFrame, idx: int, direction: str,
-                       stop_ticks: int, target_ticks: int, max_bars: int = 20) -> Optional[Dict]:
+    def simulate_trade(self, df, idx, direction, stop_ticks, target_ticks, max_bars=20):
         if idx + max_bars >= len(df):
             return None
 
@@ -194,9 +176,7 @@ class TradeAnalyzer:
                 'entry_price': entry, 'entry_time': entry_time,
                 'exit_price': entry, 'exit_time': df.iloc[idx + max_bars]['timestamp'].isoformat()}
 
-    def analyze(self, df: pd.DataFrame, config: dict) -> Dict:
-        results = []
-
+    def analyze(self, df, config):
         min_win_rate = config.get('minWinRate', 70)
         min_trades = config.get('minTrades', 10)
 
@@ -208,126 +188,104 @@ class TradeAnalyzer:
         atr_periodo = int(df['atr_periodo'].iloc[0]) if 'atr_periodo' in df.columns else 14
         pivot_range = df['pivot_range'].iloc[0] if 'pivot_range' in df.columns else 'Daily'
 
-        print(f"Iniciando análise: min_win_rate={min_win_rate}, min_trades={min_trades}")
-        print(f"Timeframe: {timeframe_valor} {timeframe_tipo}, EMA({ema_periodo}), RSI({rsi_periodo},{rsi_smooth}), ATR({atr_periodo})")
-
         setups = []
 
-        # Setup 1: Abertura USA
-        for rsi_long in [35, 40, 45, 50]:
-            for rsi_short in [50, 55, 60, 65]:
-                for minuto in [30, 35, 40]:
+        # ── CATEGORIA 1: RSI + EMA + Direção (triplo filtro) ──
+        for rsi_low in [25, 30, 35, 40]:
+            for ema_dist in [3, 5, 10, 15]:
+                cond_long = (
+                    (df['rsi'] < rsi_low) &
+                    (df['ema_dist_ticks'] < -ema_dist) &
+                    (df['direcao'] == 'ALTA')
+                )
+                cond_short = (
+                    (df['rsi'] > (100 - rsi_low)) &
+                    (df['ema_dist_ticks'] > ema_dist) &
+                    (df['direcao'] == 'BAIXA')
+                )
+                setups.append({
+                    'name': f'RSI{rsi_low}_EMA{ema_dist}_Dir',
+                    'long': cond_long,
+                    'short': cond_short,
+                    'rules': {
+                        'timeframe': {'tipo': timeframe_tipo, 'valor': timeframe_valor},
+                        'indicators': [
+                            {'name': 'RSI', 'periodo': rsi_periodo, 'smooth': rsi_smooth},
+                            {'name': 'EMA', 'periodo': ema_periodo},
+                            {'name': 'Candle Direction', 'campo': 'direcao'},
+                        ],
+                        'entry_long': [
+                            {'campo': 'rsi', 'operador': '<', 'valor': rsi_low, 'descricao': f'RSI({rsi_periodo}) abaixo de {rsi_low} (sobrevendido)'},
+                            {'campo': 'ema_dist_ticks', 'operador': '<', 'valor': -ema_dist, 'descricao': f'Preço {ema_dist}+ ticks abaixo da EMA({ema_periodo})'},
+                            {'campo': 'direcao', 'operador': '==', 'valor': 'ALTA', 'descricao': 'Candle de alta confirmando reversão'},
+                        ],
+                        'entry_short': [
+                            {'campo': 'rsi', 'operador': '>', 'valor': 100 - rsi_low, 'descricao': f'RSI({rsi_periodo}) acima de {100 - rsi_low} (sobrecomprado)'},
+                            {'campo': 'ema_dist_ticks', 'operador': '>', 'valor': ema_dist, 'descricao': f'Preço {ema_dist}+ ticks acima da EMA({ema_periodo})'},
+                            {'campo': 'direcao', 'operador': '==', 'valor': 'BAIXA', 'descricao': 'Candle de baixa confirmando reversão'},
+                        ],
+                        'exit': {'tipo': 'STOP_TARGET', 'max_bars': 20, 'descricao': 'Stop/Target (máx 20 barras)'}
+                    }
+                })
+
+        # ── CATEGORIA 2: RSI + EMA + ATR (volatilidade) ──
+        for rsi_low in [30, 35, 40]:
+            for atr_min in [8, 12, 16]:
+                for ema_dist in [5, 10]:
                     cond_long = (
-                        (df['hora'] == 9) &
-                        (df['minuto'] >= minuto) &
-                        (df['rsi'] < rsi_long) &
-                        (df['direcao'] == 'ALTA')
+                        (df['rsi'] < rsi_low) &
+                        (df['ema_dist_ticks'] < -ema_dist) &
+                        (df['atr_ticks'] >= atr_min)
                     )
                     cond_short = (
-                        (df['hora'] == 9) &
-                        (df['minuto'] >= minuto) &
-                        (df['rsi'] > rsi_short) &
-                        (df['direcao'] == 'BAIXA')
+                        (df['rsi'] > (100 - rsi_low)) &
+                        (df['ema_dist_ticks'] > ema_dist) &
+                        (df['atr_ticks'] >= atr_min)
                     )
                     setups.append({
-                        'name': f'Abertura_RSI{rsi_long}_{rsi_short}_M{minuto}',
+                        'name': f'RSI{rsi_low}_EMA{ema_dist}_ATR{atr_min}',
                         'long': cond_long,
                         'short': cond_short,
                         'rules': {
                             'timeframe': {'tipo': timeframe_tipo, 'valor': timeframe_valor},
                             'indicators': [
                                 {'name': 'RSI', 'periodo': rsi_periodo, 'smooth': rsi_smooth},
-                                {'name': 'Candle Direction', 'campo': 'direcao'},
+                                {'name': 'EMA', 'periodo': ema_periodo},
+                                {'name': 'ATR', 'periodo': atr_periodo},
                             ],
                             'entry_long': [
-                                {'campo': 'hora', 'operador': '==', 'valor': 9, 'descricao': 'Horário de abertura EUA'},
-                                {'campo': 'minuto', 'operador': '>=', 'valor': minuto, 'descricao': f'A partir do minuto {minuto}'},
-                                {'campo': 'rsi', 'operador': '<', 'valor': rsi_long, 'descricao': f'RSI abaixo de {rsi_long} (sobrevendido)'},
-                                {'campo': 'direcao', 'operador': '==', 'valor': 'ALTA', 'descricao': 'Candle de alta (bullish)'},
+                                {'campo': 'rsi', 'operador': '<', 'valor': rsi_low, 'descricao': f'RSI({rsi_periodo}) < {rsi_low}'},
+                                {'campo': 'ema_dist_ticks', 'operador': '<', 'valor': -ema_dist, 'descricao': f'Preço {ema_dist}+ ticks abaixo EMA({ema_periodo})'},
+                                {'campo': 'atr_ticks', 'operador': '>=', 'valor': atr_min, 'descricao': f'ATR({atr_periodo}) >= {atr_min} ticks (volatilidade mínima)'},
                             ],
                             'entry_short': [
-                                {'campo': 'hora', 'operador': '==', 'valor': 9, 'descricao': 'Horário de abertura EUA'},
-                                {'campo': 'minuto', 'operador': '>=', 'valor': minuto, 'descricao': f'A partir do minuto {minuto}'},
-                                {'campo': 'rsi', 'operador': '>', 'valor': rsi_short, 'descricao': f'RSI acima de {rsi_short} (sobrecomprado)'},
-                                {'campo': 'direcao', 'operador': '==', 'valor': 'BAIXA', 'descricao': 'Candle de baixa (bearish)'},
+                                {'campo': 'rsi', 'operador': '>', 'valor': 100 - rsi_low, 'descricao': f'RSI({rsi_periodo}) > {100 - rsi_low}'},
+                                {'campo': 'ema_dist_ticks', 'operador': '>', 'valor': ema_dist, 'descricao': f'Preço {ema_dist}+ ticks acima EMA({ema_periodo})'},
+                                {'campo': 'atr_ticks', 'operador': '>=', 'valor': atr_min, 'descricao': f'ATR({atr_periodo}) >= {atr_min} ticks (volatilidade mínima)'},
                             ],
-                            'exit': {
-                                'tipo': 'STOP_TARGET',
-                                'max_bars': 20,
-                                'descricao': 'Saída por stop loss ou take profit, o que ocorrer primeiro (máx 20 barras)'
-                            }
+                            'exit': {'tipo': 'STOP_TARGET', 'max_bars': 20, 'descricao': 'Stop/Target (máx 20 barras)'}
                         }
                     })
 
-        # Setup 2: RSI Extremo
-        for rsi_low in [20, 25, 30]:
-            for rsi_high in [70, 75, 80]:
-                cond_long = (df['rsi'] < rsi_low) & (df['direcao'] == 'ALTA')
-                cond_short = (df['rsi'] > rsi_high) & (df['direcao'] == 'BAIXA')
+        # ── CATEGORIA 3: Pivot + RSI + Direção (triplo filtro) ──
+        pivot_combos = [
+            ('ENTRE_S1_PP', 'ENTRE_PP_R1'),
+            ('ABAIXO_S1', 'ACIMA_R1'),
+        ]
+        for zona_long, zona_short in pivot_combos:
+            for rsi_low in [35, 40, 45]:
+                cond_long = (
+                    (df['pivot_zona'] == zona_long) &
+                    (df['rsi'] < rsi_low) &
+                    (df['direcao'] == 'ALTA')
+                )
+                cond_short = (
+                    (df['pivot_zona'] == zona_short) &
+                    (df['rsi'] > (100 - rsi_low)) &
+                    (df['direcao'] == 'BAIXA')
+                )
                 setups.append({
-                    'name': f'RSI_Extremo_{rsi_low}_{rsi_high}',
-                    'long': cond_long,
-                    'short': cond_short,
-                    'rules': {
-                        'timeframe': {'tipo': timeframe_tipo, 'valor': timeframe_valor},
-                        'indicators': [
-                            {'name': 'RSI', 'periodo': rsi_periodo, 'smooth': rsi_smooth},
-                            {'name': 'Candle Direction', 'campo': 'direcao'},
-                        ],
-                        'entry_long': [
-                            {'campo': 'rsi', 'operador': '<', 'valor': rsi_low, 'descricao': f'RSI extremo abaixo de {rsi_low}'},
-                            {'campo': 'direcao', 'operador': '==', 'valor': 'ALTA', 'descricao': 'Candle de alta confirmando reversão'},
-                        ],
-                        'entry_short': [
-                            {'campo': 'rsi', 'operador': '>', 'valor': rsi_high, 'descricao': f'RSI extremo acima de {rsi_high}'},
-                            {'campo': 'direcao', 'operador': '==', 'valor': 'BAIXA', 'descricao': 'Candle de baixa confirmando reversão'},
-                        ],
-                        'exit': {
-                            'tipo': 'STOP_TARGET',
-                            'max_bars': 20,
-                            'descricao': 'Saída por stop loss ou take profit'
-                        }
-                    }
-                })
-
-        # Setup 3: EMA Distância
-        for dist in [5, 10, 15, 20, 30]:
-            for rsi_filter in [35, 40, 45]:
-                cond_long = (df['ema_dist_ticks'] < -dist) & (df['rsi'] < rsi_filter)
-                cond_short = (df['ema_dist_ticks'] > dist) & (df['rsi'] > (100 - rsi_filter))
-                setups.append({
-                    'name': f'EMA_Dist_{dist}_RSI{rsi_filter}',
-                    'long': cond_long,
-                    'short': cond_short,
-                    'rules': {
-                        'timeframe': {'tipo': timeframe_tipo, 'valor': timeframe_valor},
-                        'indicators': [
-                            {'name': 'EMA', 'periodo': ema_periodo},
-                            {'name': 'RSI', 'periodo': rsi_periodo, 'smooth': rsi_smooth},
-                        ],
-                        'entry_long': [
-                            {'campo': 'ema_dist_ticks', 'operador': '<', 'valor': -dist, 'descricao': f'Preço {dist}+ ticks abaixo da EMA({ema_periodo})'},
-                            {'campo': 'rsi', 'operador': '<', 'valor': rsi_filter, 'descricao': f'RSI abaixo de {rsi_filter}'},
-                        ],
-                        'entry_short': [
-                            {'campo': 'ema_dist_ticks', 'operador': '>', 'valor': dist, 'descricao': f'Preço {dist}+ ticks acima da EMA({ema_periodo})'},
-                            {'campo': 'rsi', 'operador': '>', 'valor': 100 - rsi_filter, 'descricao': f'RSI acima de {100 - rsi_filter}'},
-                        ],
-                        'exit': {
-                            'tipo': 'STOP_TARGET',
-                            'max_bars': 20,
-                            'descricao': 'Saída por stop loss ou take profit'
-                        }
-                    }
-                })
-
-        # Setup 4: Pivot Zone
-        for zona_long in ['ENTRE_S1_PP']:
-            for zona_short in ['ENTRE_PP_R1']:
-                cond_long = (df['pivot_zona'] == zona_long) & (df['direcao'] == 'ALTA') & (df['rsi'] < 45)
-                cond_short = (df['pivot_zona'] == zona_short) & (df['direcao'] == 'BAIXA') & (df['rsi'] > 55)
-                setups.append({
-                    'name': f'Pivot_{zona_long}_{zona_short}',
+                    'name': f'Pivot_{zona_long}_RSI{rsi_low}_Dir',
                     'long': cond_long,
                     'short': cond_short,
                     'rules': {
@@ -338,115 +296,248 @@ class TradeAnalyzer:
                             {'name': 'Candle Direction', 'campo': 'direcao'},
                         ],
                         'entry_long': [
-                            {'campo': 'pivot_zona', 'operador': '==', 'valor': zona_long, 'descricao': f'Preço na zona {zona_long}'},
+                            {'campo': 'pivot_zona', 'operador': '==', 'valor': zona_long, 'descricao': f'Preço na zona {zona_long} do Pivot {pivot_range}'},
+                            {'campo': 'rsi', 'operador': '<', 'valor': rsi_low, 'descricao': f'RSI({rsi_periodo}) < {rsi_low}'},
                             {'campo': 'direcao', 'operador': '==', 'valor': 'ALTA', 'descricao': 'Candle de alta'},
-                            {'campo': 'rsi', 'operador': '<', 'valor': 45, 'descricao': 'RSI abaixo de 45'},
                         ],
                         'entry_short': [
-                            {'campo': 'pivot_zona', 'operador': '==', 'valor': zona_short, 'descricao': f'Preço na zona {zona_short}'},
+                            {'campo': 'pivot_zona', 'operador': '==', 'valor': zona_short, 'descricao': f'Preço na zona {zona_short} do Pivot {pivot_range}'},
+                            {'campo': 'rsi', 'operador': '>', 'valor': 100 - rsi_low, 'descricao': f'RSI({rsi_periodo}) > {100 - rsi_low}'},
                             {'campo': 'direcao', 'operador': '==', 'valor': 'BAIXA', 'descricao': 'Candle de baixa'},
-                            {'campo': 'rsi', 'operador': '>', 'valor': 55, 'descricao': 'RSI acima de 55'},
                         ],
-                        'exit': {
-                            'tipo': 'STOP_TARGET',
-                            'max_bars': 20,
-                            'descricao': 'Saída por stop loss ou take profit'
-                        }
+                        'exit': {'tipo': 'STOP_TARGET', 'max_bars': 20, 'descricao': 'Stop/Target (máx 20 barras)'}
                     }
                 })
 
-        # Stop/Target configs
+        # ── CATEGORIA 4: Pivot + EMA + ATR (sem RSI, contexto diferente) ──
+        for zona_long, zona_short in pivot_combos:
+            for ema_dist in [5, 10]:
+                for atr_min in [10, 15]:
+                    cond_long = (
+                        (df['pivot_zona'] == zona_long) &
+                        (df['ema_dist_ticks'] < -ema_dist) &
+                        (df['atr_ticks'] >= atr_min)
+                    )
+                    cond_short = (
+                        (df['pivot_zona'] == zona_short) &
+                        (df['ema_dist_ticks'] > ema_dist) &
+                        (df['atr_ticks'] >= atr_min)
+                    )
+                    setups.append({
+                        'name': f'Pivot_{zona_long}_EMA{ema_dist}_ATR{atr_min}',
+                        'long': cond_long,
+                        'short': cond_short,
+                        'rules': {
+                            'timeframe': {'tipo': timeframe_tipo, 'valor': timeframe_valor},
+                            'indicators': [
+                                {'name': 'Fibonacci Pivots', 'range': pivot_range},
+                                {'name': 'EMA', 'periodo': ema_periodo},
+                                {'name': 'ATR', 'periodo': atr_periodo},
+                            ],
+                            'entry_long': [
+                                {'campo': 'pivot_zona', 'operador': '==', 'valor': zona_long, 'descricao': f'Zona {zona_long} do Pivot {pivot_range}'},
+                                {'campo': 'ema_dist_ticks', 'operador': '<', 'valor': -ema_dist, 'descricao': f'Preço {ema_dist}+ ticks abaixo EMA({ema_periodo})'},
+                                {'campo': 'atr_ticks', 'operador': '>=', 'valor': atr_min, 'descricao': f'ATR({atr_periodo}) >= {atr_min} ticks'},
+                            ],
+                            'entry_short': [
+                                {'campo': 'pivot_zona', 'operador': '==', 'valor': zona_short, 'descricao': f'Zona {zona_short} do Pivot {pivot_range}'},
+                                {'campo': 'ema_dist_ticks', 'operador': '>', 'valor': ema_dist, 'descricao': f'Preço {ema_dist}+ ticks acima EMA({ema_periodo})'},
+                                {'campo': 'atr_ticks', 'operador': '>=', 'valor': atr_min, 'descricao': f'ATR({atr_periodo}) >= {atr_min} ticks'},
+                            ],
+                            'exit': {'tipo': 'STOP_TARGET', 'max_bars': 20, 'descricao': 'Stop/Target (máx 20 barras)'}
+                        }
+                    })
+
+        # ── CATEGORIA 5: RSI + EMA + Pivot + Direção (QUÁDRUPLO filtro - mais seletivo) ──
+        for rsi_low in [30, 35, 40]:
+            for ema_dist in [3, 5, 10]:
+                for zona_long, zona_short in pivot_combos:
+                    cond_long = (
+                        (df['rsi'] < rsi_low) &
+                        (df['ema_dist_ticks'] < -ema_dist) &
+                        (df['pivot_zona'] == zona_long) &
+                        (df['direcao'] == 'ALTA')
+                    )
+                    cond_short = (
+                        (df['rsi'] > (100 - rsi_low)) &
+                        (df['ema_dist_ticks'] > ema_dist) &
+                        (df['pivot_zona'] == zona_short) &
+                        (df['direcao'] == 'BAIXA')
+                    )
+                    setups.append({
+                        'name': f'Quad_RSI{rsi_low}_EMA{ema_dist}_{zona_long}',
+                        'long': cond_long,
+                        'short': cond_short,
+                        'rules': {
+                            'timeframe': {'tipo': timeframe_tipo, 'valor': timeframe_valor},
+                            'indicators': [
+                                {'name': 'RSI', 'periodo': rsi_periodo, 'smooth': rsi_smooth},
+                                {'name': 'EMA', 'periodo': ema_periodo},
+                                {'name': 'Fibonacci Pivots', 'range': pivot_range},
+                                {'name': 'Candle Direction', 'campo': 'direcao'},
+                            ],
+                            'entry_long': [
+                                {'campo': 'rsi', 'operador': '<', 'valor': rsi_low, 'descricao': f'RSI({rsi_periodo}) < {rsi_low}'},
+                                {'campo': 'ema_dist_ticks', 'operador': '<', 'valor': -ema_dist, 'descricao': f'Preço {ema_dist}+ ticks abaixo EMA({ema_periodo})'},
+                                {'campo': 'pivot_zona', 'operador': '==', 'valor': zona_long, 'descricao': f'Zona {zona_long} do Pivot'},
+                                {'campo': 'direcao', 'operador': '==', 'valor': 'ALTA', 'descricao': 'Candle de alta'},
+                            ],
+                            'entry_short': [
+                                {'campo': 'rsi', 'operador': '>', 'valor': 100 - rsi_low, 'descricao': f'RSI({rsi_periodo}) > {100 - rsi_low}'},
+                                {'campo': 'ema_dist_ticks', 'operador': '>', 'valor': ema_dist, 'descricao': f'Preço {ema_dist}+ ticks acima EMA({ema_periodo})'},
+                                {'campo': 'pivot_zona', 'operador': '==', 'valor': zona_short, 'descricao': f'Zona {zona_short} do Pivot'},
+                                {'campo': 'direcao', 'operador': '==', 'valor': 'BAIXA', 'descricao': 'Candle de baixa'},
+                            ],
+                            'exit': {'tipo': 'STOP_TARGET', 'max_bars': 20, 'descricao': 'Stop/Target (máx 20 barras)'}
+                        }
+                    })
+
+        # ── CATEGORIA 6: Abertura USA + RSI + EMA + Direção ──
+        for rsi_low in [35, 40]:
+            for ema_dist in [3, 5]:
+                for minuto in [30, 35]:
+                    cond_long = (
+                        (df['hora'] == 9) &
+                        (df['minuto'] >= minuto) &
+                        (df['rsi'] < rsi_low) &
+                        (df['ema_dist_ticks'] < -ema_dist) &
+                        (df['direcao'] == 'ALTA')
+                    )
+                    cond_short = (
+                        (df['hora'] == 9) &
+                        (df['minuto'] >= minuto) &
+                        (df['rsi'] > (100 - rsi_low)) &
+                        (df['ema_dist_ticks'] > ema_dist) &
+                        (df['direcao'] == 'BAIXA')
+                    )
+                    setups.append({
+                        'name': f'Abertura_RSI{rsi_low}_EMA{ema_dist}_Apos9h{minuto}',
+                        'long': cond_long,
+                        'short': cond_short,
+                        'rules': {
+                            'timeframe': {'tipo': timeframe_tipo, 'valor': timeframe_valor},
+                            'indicators': [
+                                {'name': 'RSI', 'periodo': rsi_periodo, 'smooth': rsi_smooth},
+                                {'name': 'EMA', 'periodo': ema_periodo},
+                                {'name': 'Candle Direction', 'campo': 'direcao'},
+                                {'name': 'Horário', 'campo': 'hora/minuto'},
+                            ],
+                            'entry_long': [
+                                {'campo': 'hora', 'operador': '==', 'valor': 9, 'descricao': 'Hora de abertura EUA'},
+                                {'campo': 'minuto', 'operador': '>=', 'valor': minuto, 'descricao': f'A partir das 9:{minuto}'},
+                                {'campo': 'rsi', 'operador': '<', 'valor': rsi_low, 'descricao': f'RSI({rsi_periodo}) < {rsi_low}'},
+                                {'campo': 'ema_dist_ticks', 'operador': '<', 'valor': -ema_dist, 'descricao': f'Preço {ema_dist}+ ticks abaixo EMA({ema_periodo})'},
+                                {'campo': 'direcao', 'operador': '==', 'valor': 'ALTA', 'descricao': 'Candle de alta'},
+                            ],
+                            'entry_short': [
+                                {'campo': 'hora', 'operador': '==', 'valor': 9, 'descricao': 'Hora de abertura EUA'},
+                                {'campo': 'minuto', 'operador': '>=', 'valor': minuto, 'descricao': f'A partir das 9:{minuto}'},
+                                {'campo': 'rsi', 'operador': '>', 'valor': 100 - rsi_low, 'descricao': f'RSI({rsi_periodo}) > {100 - rsi_low}'},
+                                {'campo': 'ema_dist_ticks', 'operador': '>', 'valor': ema_dist, 'descricao': f'Preço {ema_dist}+ ticks acima EMA({ema_periodo})'},
+                                {'campo': 'direcao', 'operador': '==', 'valor': 'BAIXA', 'descricao': 'Candle de baixa'},
+                            ],
+                            'exit': {'tipo': 'STOP_TARGET', 'max_bars': 20, 'descricao': 'Stop/Target (máx 20 barras)'}
+                        }
+                    })
+
+        # ── Stop/Target configs ──
         user_stop = config.get('stopTicks', 20)
         user_target = config.get('targetTicks', 40)
-        configs_test = [
-            {'stop': user_stop, 'target': user_target},
-            {'stop': 10, 'target': 20},
-            {'stop': 15, 'target': 30},
-            {'stop': 20, 'target': 40},
-            {'stop': 10, 'target': 30},
-            {'stop': 15, 'target': 45},
-            {'stop': 8, 'target': 16},
-            {'stop': 12, 'target': 24},
-        ]
+        configs_test = []
         seen = set()
-        unique_configs = []
-        for c in configs_test:
+        for c in [
+            {'stop': user_stop, 'target': user_target},
+            {'stop': 10, 'target': 20}, {'stop': 15, 'target': 30},
+            {'stop': 20, 'target': 40}, {'stop': 10, 'target': 30},
+            {'stop': 15, 'target': 45}, {'stop': 8, 'target': 16},
+            {'stop': 12, 'target': 24},
+        ]:
             key = (c['stop'], c['target'])
             if key not in seen:
                 seen.add(key)
-                unique_configs.append(c)
-        configs_test = unique_configs
+                configs_test.append(c)
 
         total_tests = len(setups) * len(configs_test)
-        print(f"Total de combinações a testar: {total_tests}")
+        print(f"Setups: {len(setups)}, Configs: {len(configs_test)}, Total: {total_tests}")
+
+        results = []
 
         for setup in setups:
             for cfg in configs_test:
-                trades = []
                 stop_ticks = cfg['stop']
                 target_ticks = cfg['target']
+                max_bars = 20
 
-                long_signals = df[setup['long']].index
-                for idx in long_signals:
-                    if idx < len(df) - 20:
-                        result = self.simulate_trade(df, idx, 'LONG', stop_ticks, target_ticks)
-                        if result:
-                            trades.append({**result, 'tipo': 'LONG'})
+                # Combinar e ordenar sinais
+                all_signals = []
+                for idx in df[setup['long']].index.tolist():
+                    all_signals.append((idx, 'LONG'))
+                for idx in df[setup['short']].index.tolist():
+                    all_signals.append((idx, 'SHORT'))
+                all_signals.sort(key=lambda x: x[0])
 
-                short_signals = df[setup['short']].index
-                for idx in short_signals:
-                    if idx < len(df) - 20:
-                        result = self.simulate_trade(df, idx, 'SHORT', stop_ticks, target_ticks)
-                        if result:
-                            trades.append({**result, 'tipo': 'SHORT'})
+                # ★ UMA ENTRADA POR VEZ ★
+                trades = []
+                next_allowed_bar = 0
 
-                if len(trades) >= min_trades:
-                    closed = [t for t in trades if t['result'] != 'OPEN']
-                    if len(closed) > 0:
-                        wins = len([t for t in closed if t['result'] == 'TARGET'])
-                        win_rate = (wins / len(closed)) * 100
+                for idx, direction in all_signals:
+                    if idx < next_allowed_bar:
+                        continue
+                    if idx + max_bars >= len(df):
+                        continue
 
-                        if win_rate >= min_win_rate:
-                            total_profit = sum(t['profit'] for t in closed)
-                            gross_profit = sum(t['profit'] for t in closed if t['profit'] > 0)
-                            gross_loss = abs(sum(t['profit'] for t in closed if t['profit'] < 0))
-                            profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999
+                    result = self.simulate_trade(df, idx, direction, stop_ticks, target_ticks, max_bars)
+                    if result:
+                        result['tipo'] = direction
+                        trades.append(result)
+                        next_allowed_bar = idx + result['bars'] + 1
 
-                            results.append({
-                                'setup_name': setup['name'],
+                closed = [t for t in trades if t['result'] != 'OPEN']
+                if len(closed) >= min_trades:
+                    wins = len([t for t in closed if t['result'] == 'TARGET'])
+                    win_rate = (wins / len(closed)) * 100
+
+                    if win_rate >= min_win_rate:
+                        total_profit = sum(t['profit'] for t in closed)
+                        gross_profit = sum(t['profit'] for t in closed if t['profit'] > 0)
+                        gross_loss = abs(sum(t['profit'] for t in closed if t['profit'] < 0))
+                        profit_factor = gross_profit / gross_loss if gross_loss > 0 else 999
+
+                        results.append({
+                            'setup_name': setup['name'],
+                            'stop_ticks': stop_ticks,
+                            'target_ticks': target_ticks,
+                            'ratio': f"1:{round(target_ticks / stop_ticks, 1)}",
+                            'total_trades': len(closed),
+                            'wins': wins,
+                            'losses': len(closed) - wins,
+                            'win_rate': round(win_rate, 1),
+                            'profit_factor': round(profit_factor, 2),
+                            'net_profit_ticks': total_profit,
+                            'net_profit_usd': round(total_profit * self.tick_value, 2),
+                            'avg_profit_per_trade': round((total_profit * self.tick_value) / len(closed), 2),
+                            'rules': setup['rules'],
+                            'rules_exit': {
+                                **setup['rules']['exit'],
                                 'stop_ticks': stop_ticks,
                                 'target_ticks': target_ticks,
-                                'ratio': f"1:{round(target_ticks / stop_ticks, 1)}",
-                                'total_trades': len(closed),
-                                'wins': wins,
-                                'losses': len(closed) - wins,
-                                'win_rate': round(win_rate, 1),
-                                'profit_factor': round(profit_factor, 2),
-                                'net_profit_ticks': total_profit,
-                                'net_profit_usd': round(total_profit * self.tick_value, 2),
-                                'avg_profit_per_trade': round((total_profit * self.tick_value) / len(closed), 2),
-                                'rules': setup['rules'],
-                                'rules_exit': {
-                                    **setup['rules']['exit'],
-                                    'stop_ticks': stop_ticks,
-                                    'target_ticks': target_ticks,
-                                    'stop_usd': round(stop_ticks * self.tick_value, 2),
-                                    'target_usd': round(target_ticks * self.tick_value, 2),
-                                },
-                                'sample_trades': [
-                                    {
-                                        'tipo': t['tipo'],
-                                        'result': t['result'],
-                                        'profit_ticks': t['profit'],
-                                        'entry_price': t.get('entry_price'),
-                                        'entry_time': t.get('entry_time'),
-                                        'exit_price': t.get('exit_price'),
-                                        'exit_time': t.get('exit_time'),
-                                        'bars': t['bars'],
-                                    }
-                                    for t in closed[:10]
-                                ],
-                            })
+                                'stop_usd': round(stop_ticks * self.tick_value, 2),
+                                'target_usd': round(target_ticks * self.tick_value, 2),
+                            },
+                            'sample_trades': [
+                                {
+                                    'tipo': t['tipo'],
+                                    'result': t['result'],
+                                    'profit_ticks': t['profit'],
+                                    'entry_price': t.get('entry_price'),
+                                    'entry_time': t.get('entry_time'),
+                                    'exit_price': t.get('exit_price'),
+                                    'exit_time': t.get('exit_time'),
+                                    'bars': t['bars'],
+                                }
+                                for t in closed[:10]
+                            ],
+                        })
 
         results.sort(key=lambda x: x['win_rate'], reverse=True)
 
@@ -477,7 +568,7 @@ analyzer = TradeAnalyzer()
 
 @app.get("/")
 def home():
-    return {"message": "TradeLog API está rodando!", "status": "online"}
+    return {"message": "TradeLog Analyzer API v2", "status": "online"}
 
 
 @app.get("/api/v1/health")
@@ -491,41 +582,29 @@ async def analyze_file(
     config: str = Form('{"minWinRate": 70, "minTrades": 10}')
 ):
     try:
-        print(f"Recebendo arquivo: {file.filename}")
         contents = await file.read()
         content_str = contents.decode('utf-8')
-        print(f"Tamanho: {len(content_str)} caracteres")
 
         try:
             config_dict = json.loads(config)
         except:
             config_dict = {"minWinRate": 70, "minTrades": 10}
 
-        print(f"Config: {config_dict}")
-
         data_list = analyzer.parse_json_file(content_str)
-
         if not data_list:
             return {"status": "error", "message": "Nenhum dado JSON válido encontrado"}
 
         df = analyzer.convert_to_dataframe(data_list)
-
         if len(df) == 0:
             return {"status": "error", "message": "Nenhum dado válido após conversão"}
 
         results = analyzer.analyze(df, config_dict)
 
-        return {
-            "status": "completed",
-            "filename": file.filename,
-            "results": results
-        }
+        return {"status": "completed", "filename": file.filename, "results": results}
 
     except Exception as e:
         import traceback
-        error_detail = traceback.format_exc()
-        print(f"ERRO: {str(e)}")
-        return {"status": "error", "message": str(e), "detail": error_detail}
+        return {"status": "error", "message": str(e), "detail": traceback.format_exc()}
 
 
 if __name__ == "__main__":
