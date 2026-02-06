@@ -178,7 +178,6 @@ class TradeAnalyzer:
 
     def analyze(self, df, config):
         min_win_rate = config.get('minWinRate', 70)
-        min_trades = config.get('minTrades', 10)
 
         timeframe_tipo = df['timeframe_tipo'].iloc[0] if 'timeframe_tipo' in df.columns else 'Minute'
         timeframe_valor = int(df['timeframe_valor'].iloc[0]) if 'timeframe_valor' in df.columns else 1
@@ -493,7 +492,7 @@ class TradeAnalyzer:
                         next_allowed_bar = idx + result['bars'] + 1
 
                 closed = [t for t in trades if t['result'] != 'OPEN']
-                if len(closed) >= min_trades:
+                if len(closed) > 0:
                     wins = len([t for t in closed if t['result'] == 'TARGET'])
                     win_rate = (wins / len(closed)) * 100
 
@@ -579,7 +578,7 @@ def health_check():
 @app.post("/api/v1/analyze")
 async def analyze_file(
     file: UploadFile = File(...),
-    config: str = Form('{"minWinRate": 70, "minTrades": 10}')
+    config: str = Form('{"minWinRate": 70}')
 ):
     try:
         contents = await file.read()
@@ -588,7 +587,7 @@ async def analyze_file(
         try:
             config_dict = json.loads(config)
         except:
-            config_dict = {"minWinRate": 70, "minTrades": 10}
+            config_dict = {"minWinRate": 70}
 
         data_list = analyzer.parse_json_file(content_str)
         if not data_list:
