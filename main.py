@@ -237,76 +237,66 @@ analyzer = TradeAnalyzer()
 
 
 def generate_all_setups():
-    """Gera todas as combinações de condições de entrada."""
     setups = []
     
-    # Variações de RSI
     rsi_conditions = [
+        {"campo": "rsi", "operador": "<", "valor": 25},
         {"campo": "rsi", "operador": "<", "valor": 30},
+        {"campo": "rsi", "operador": "<", "valor": 35},
         {"campo": "rsi", "operador": "<", "valor": 40},
+        {"campo": "rsi", "operador": ">", "valor": 55},
         {"campo": "rsi", "operador": ">", "valor": 60},
+        {"campo": "rsi", "operador": ">", "valor": 65},
         {"campo": "rsi", "operador": ">", "valor": 70},
+        {"campo": "rsi", "operador": ">", "valor": 75},
     ]
     
-    # Variações de EMA (preço vs EMA)
-    # close_vs_ema: 1 (acima), -1 (abaixo)
     ema_conditions = [
-        {"campo": "close_vs_ema", "operador": "==", "valor": 1},  # acima
-        {"campo": "close_vs_ema", "operador": "==", "valor": -1}, # abaixo
+        {"campo": "close_vs_ema", "operador": "==", "valor": 1},
+        {"campo": "close_vs_ema", "operador": "==", "valor": -1},
     ]
     
-    # Direção da barra
+    ema_dist_conditions = [
+        {"campo": "ema_dist_ticks", "operador": ">", "valor": 5},
+        {"campo": "ema_dist_ticks", "operador": ">", "valor": 10},
+        {"campo": "ema_dist_ticks", "operador": "<", "valor": -5},
+        {"campo": "ema_dist_ticks", "operador": "<", "valor": -10},
+    ]
+    
     dir_conditions = [
         {"campo": "direcao", "operador": "==", "valor": "ALTA"},
         {"campo": "direcao", "operador": "==", "valor": "BAIXA"},
     ]
     
-    # Zona pivot (Simplificado)
-    # Se o log traz pivot_zona como string "ENTRE_S1_PP", "ACIMA_R1", etc.
-    # Vamos usar genericamente alguns valores comuns se existirem nos dados.
-    # Para ser robusto, podemos ignorar pivot se não soubermos os valores exatos,
-    # OU assumir que o "parse_json_file" traz valores consistentes.
-    pivot_conditions = [
-        # Exemplo: testar zonas se existirem. Se não, ficarão vazios.
-        # Vamos omitir para garantir que não quebre se o dado não tiver pivots.
-        # Ou adicionar genericamente se quiser.
-    ]
-    
-    # Gerar combinações (2 a 3 condições por setup)
-    # Importante: Um setup deve ter uma DIREÇÃO para sabermos se é Long ou Short.
-    # Então vamos iterar sobre dir_conditions e combinar com outros.
-    
-    base_filters = rsi_conditions + ema_conditions
+    # Combinar todos os filtros de indicadores
+    all_filters = rsi_conditions + ema_conditions + ema_dist_conditions
     
     idx = 0
-    # setups com 1 indicador + direção
+    # setups com 1 indicador + direção (simples)
     for direct in dir_conditions:
-        for f1 in base_filters:
+        for f1 in all_filters:
             idx += 1
-            # Evitar contradições óbvias (ex: RSI > 70 e Direção ALTA é ok, mas RSI > 70 costuma ser venda em reversão.
-            # O gerador é "burro", testa tudo. O filtro de WinRate elimina o ruim).
-            
-            combo = [direct, f1]
-            name = f"Setup {idx}: {direct['valor']} + {f1['campo']}{f1['operador']}{f1['valor']}"
+            # Ex: S1: A+rsi<30
             setups.append({
-                "name": name,
-                "conditions": combo
+                "name": f"S{idx}:{direct['valor'][:1]}+{f1['campo']}{f1['operador']}{f1['valor']}",
+                "conditions": [direct, f1]
             })
-            
-            # setups com 2 indicadores + direção
-            for f2 in base_filters:
-                if f1 == f2: continue
-                # Evitar conflitos de mesmo campo (ex: rsi < 30 e rsi > 70)
-                if f1['campo'] == f2['campo']: continue 
+        
+        # setups com 2 indicadores + direção (combinados)
+        # Iterar para combinar f1 e f2 diferentes
+        for i, f1 in enumerate(all_filters):
+            for f2 in all_filters[i+1:]:
+                # Evitar conflito de mesmo campo (ex: rsi < 30 E rsi < 40 - redundante ou conflitante)
+                if f1['campo'] == f2['campo']:
+                    continue
                 
                 idx += 1
-                combo2 = [direct, f1, f2]
-                name2 = f"Setup {idx}: {direct['valor']} + {f1['campo']} + {f2['campo']}"
                 setups.append({
-                    "name": name2,
-                    "conditions": combo2
+                    "name": f"S{idx}:{direct['valor'][:1]}+{f1['campo']}+{f2['campo']}",
+                    "conditions": [direct, f1, f2]
                 })
-    
+
+    print(f"[BATCH] Gerados {len(setups)} setups dinâmicos")
     return setups
 
 
@@ -388,59 +378,59 @@ async def analyze_batch(
                         "daily_stats": daily_stats
                     }
 
-        # 4. Filtrar consistência
-        consistent = []
+        # 4. Calcular métricas para TODOS os resultados
+        all_results_list = []
         
         for key, data in aggregated_results.items():
             stats = data['daily_stats']
-            
-            # Filtra dias que tiveram trades
             active_days = [d for d in stats if d['total_trades'] > 0]
             
-            # Se operou em poucos dias, talvez não seja consistente o suficiente
-            # (Critério arbitrário: tem que ter operado em pelo menos 1 dia? 
-            #  Ou consistência conta dias sem trade como falha? 
-            #  Vamos assumir: dias sem trade NÃO contam para a média, 
-            #  mas precisamos de um mínimo de dias operados para validar, ex: 10% dos arquivos)
-            if not active_days:
+            if not active_days or len(active_days) < 2:
                 continue
                 
             num_active = len(active_days)
             num_profitable = sum(1 for d in active_days if d['profitable'])
-            
-            # Consistência = % de dias positivos DENTRE os dias operados
             consistency = num_profitable / num_active
+            avg_wr = sum(d['win_rate'] for d in active_days) / num_active
+            total_profit = sum(d['profit'] for d in active_days)
             
-            if consistency >= min_consistency:
-                # Checar WinRate Médio
-                avg_wr = sum(d['win_rate'] for d in active_days) / num_active
-                if avg_wr >= min_wr:
-                    total_profit = sum(d['profit'] for d in active_days)
-                    
-                    consistent.append({
-                        "setup_name": data['setup']['name'],
-                        "stop_ticks": data['stop'],
-                        "target_ticks": data['target'],
-                        "days_tested": len(all_days_data),
-                        "days_with_trades": num_active,
-                        "days_profitable": num_profitable,
-                        "consistency": round(consistency, 2),
-                        "avg_win_rate": round(avg_wr, 1),
-                        "total_profit_usd": round(total_profit, 2),
-                        "avg_daily_profit_usd": round(total_profit / num_active, 2),
-                        "daily_results": active_days,
-                        # Passar regras de forma estruturada se possível
-                        "rules": {"conditions": data['setup']['conditions']} 
-                    })
+            # Calcular profit factor
+            gross_profit = sum(d['profit'] for d in active_days if d['profit'] > 0)
+            gross_loss = abs(sum(d['profit'] for d in active_days if d['profit'] < 0))
+            pf = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 99.0
+            
+            entry = {
+                "setup_name": data['setup']['name'],
+                "stop_ticks": data['stop'],
+                "target_ticks": data['target'],
+                "days_tested": len(all_days_data),
+                "days_with_trades": num_active,
+                "days_profitable": num_profitable,
+                "consistency": round(consistency, 2),
+                "avg_win_rate": round(avg_wr, 1),
+                "avg_profit_factor": pf,
+                "total_profit_usd": round(total_profit, 2),
+                "avg_daily_profit_usd": round(total_profit / num_active, 2),
+                "daily_results": active_days,
+                "rules": {"conditions": data['setup']['conditions']}
+            }
+            all_results_list.append(entry)
 
-        # Top 50 por lucro total
+        # Separar consistentes
+        consistent = [r for r in all_results_list if r['consistency'] >= min_consistency and r['avg_win_rate'] >= min_wr]
         consistent.sort(key=lambda x: x['total_profit_usd'], reverse=True)
+        
+        # Top 100 de TODOS (ordenados por consistência)
+        all_sorted = sorted(all_results_list, key=lambda x: x['consistency'], reverse=True)
+        
+        print(f"[BATCH] {len(all_results_list)} testados, {len(consistent)} consistentes")
         
         return {
             "status": "completed",
             "total_days": len(all_days_data),
             "total_setups_tested": len(aggregated_results),
-            "consistent_setups": consistent[:50]
+            "consistent_setups": consistent[:50],
+            "all_setups": all_sorted[:100]
         }
 
     except Exception as e:
@@ -455,16 +445,82 @@ def home():
 
 @app.get("/api/v1/health")
 def health_check():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}  
 
-# Manter endpoint antigo para compatibilidade se necessário, ou redirecionar.
-# Por enquanto, deixamos ele lá em cima se não foi removido, 
-# mas aqui estamos substituindo o arquivo todo.
-# Vamos reimplementar o /analyze individual simples para não quebrar o frontend antigo se houver.
 @app.post("/api/v1/analyze")
-async def analyze_file(file: UploadFile = File(...), config: str = Form('{}')):
-    # Versão simplificada que usa a nova engine, ou retorna erro dizendo use batch
-    return {"status": "deprecated", "message": "Use /api/v1/analyze-batch para análise completa."}
+async def analyze_file(
+    file: UploadFile = File(...),
+    config: str = Form('{"minWinRate": 70}')
+):
+    try:
+        contents = await file.read()
+        content_str = contents.decode('utf-8')
+
+        try:
+            config_dict = json.loads(config)
+        except:
+            config_dict = {"minWinRate": 70}
+            
+        # Para análise individual, vamos usar a mesma lógica do batch mas para 1 arquivo/setup?
+        # A API v2 usava 'analyzer.analyze(df, config)'. 
+        # Precisamos restaurar esse método na classe OU reimplementá-lo aqui.
+        # Como removemos o método 'analyze' da classe TradeAnalyzer no passo anterior, 
+        # precisamos reimplementá-lo ou adaptar.
+        
+        # Vamos fazer uma implementação rápida compatível usando a geração dinâmica:
+        data_list = analyzer.parse_json_file(content_str)
+        if not data_list:
+            return {"status": "error", "message": "Nenhum dado JSON válido encontrado"}
+
+        df = analyzer.convert_to_dataframe(data_list)
+        if len(df) == 0:
+            return {"status": "error", "message": "Nenhum dado válido após conversão"}
+            
+        # Gerar setups e testar (versão simplificada para 1 arquivo)
+        setups = generate_all_setups()
+        min_win_rate = config_dict.get('minWinRate', 70)
+        
+        results = []
+        # Testar apenas configurações padrão ou as solicitadas?
+        # Vamos testar o padrão do batch para consistência
+        user_stop = config_dict.get('stopTicks', 20)
+        user_target = config_dict.get('targetTicks', 40)
+        
+        # Se for só analisar o arquivo, podemos testar um config fixo ou varrer.
+        # Para ser rápido, vamos testar só o solicitado pelo usuário se existir, senão varrer.
+        
+        stop = user_stop
+        target = user_target
+        
+        for setup in setups:
+             trades = analyzer.backtest(df, setup['conditions'], stop, target)
+             if not trades: continue
+             
+             closed = [t for t in trades if t['result'] != 'OPEN']
+             if not closed: continue
+             
+             wins = len([t for t in closed if t['result'] == 'TARGET'])
+             wr = (wins / len(closed)) * 100
+             
+             if wr >= min_win_rate:
+                 total_profit = sum(t['profit'] for t in closed)
+                 results.append({
+                     'setup_name': setup['name'],
+                     'stop_ticks': stop,
+                     'target_ticks': target,
+                     'total_trades': len(closed),
+                     'win_rate': round(wr, 1),
+                     'net_profit_usd': round(total_profit * analyzer.tick_value, 2),
+                     'rules': {'conditions': setup['conditions']}
+                 })
+                 
+        results.sort(key=lambda x: x['win_rate'], reverse=True)
+        return {"status": "completed", "filename": file.filename, "results": results[:50]}
+
+    except Exception as e:
+        import traceback
+        return {"status": "error", "message": str(e), "detail": traceback.format_exc()}
+
 
 if __name__ == "__main__":
     import uvicorn
