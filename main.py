@@ -606,6 +606,133 @@ async def analyze_file(
         return {"status": "error", "message": str(e), "detail": traceback.format_exc()}
 
 
+@app.post("/api/v1/analyze-batch")
+async def analyze_batch(
+    files: List[UploadFile] = File(...),
+    config: str = Form('{"minWinRate": 70, "minConsistency": 0.9}')
+):
+    try:
+        try:
+            cfg = json.loads(config)
+        except:
+            cfg = {"minWinRate": 70, "minConsistency": 0.9}
+
+        min_win_rate = cfg.get("minWinRate", 70)
+        stop_ticks = cfg.get("stopTicks", 20)
+        target_ticks = cfg.get("targetTicks", 40)
+        min_consistency = cfg.get("minConsistency", 0.9)
+
+        # 1. Analisar cada arquivo (dia) individualmente
+        all_days = {}  # "setup_name" -> [{ day, win_rate, profit, ... }]
+
+        for file in files:
+            try:
+                content = await file.read()
+                filename = file.filename
+                content_str = content.decode('utf-8')
+
+                data_list = analyzer.parse_json_file(content_str)
+                if not data_list:
+                    continue
+
+                df = analyzer.convert_to_dataframe(data_list)
+                if len(df) == 0:
+                    continue
+
+                # Roda analysis pra esse dia
+                # Importante: analyzer.analyze roda varios configs, precisamos filtrar
+                # pelo stop/target solicitado no batch
+                results = analyzer.analyze(df, cfg)
+
+                # Filipar apenas o config solicitado (ou usar todos se nao filtrar, mas o pedido implica consistencia de UM setup especifico)
+                # O usuario pode querer testar consistencia de RSI30 com Stop 20 Target 40.
+                # Se main.py testa 10/20 tbm, isso seria OUTRO setup ("RSI30 (10/20)").
+                # Entao vamos criar chaves unicas para cada variaçao retornada.
+
+                for setup in results:
+                    # Chave unica: Nome + Stop + Target
+                    s_name = setup["setup_name"]
+                    s_stop = setup["rules_exit"]["stop_ticks"]
+                    s_target = setup["rules_exit"]["target_ticks"]
+                    
+                    # Se quisermos filtrar estritamente o que o user pediu:
+                    if s_stop != stop_ticks or s_target != target_ticks:
+                        continue
+
+                    # Chave simplificada pois estamos filtrando
+                    unique_key = s_name
+
+                    if unique_key not in all_days:
+                        all_days[unique_key] = []
+                    
+                    all_days[unique_key].append({
+                        "day": filename,
+                        "win_rate": setup["win_rate"],
+                        "profit": setup["net_profit_usd"],
+                        "profitable": setup["net_profit_usd"] > 0,
+                        "total_trades": setup.get("total_trades", 0),
+                    })
+            except Exception as e:
+                print(f"Erro ao processar arquivo {file.filename}: {e}")
+                continue
+
+        # 2. Filtrar: manter só setups presentes em TODOS os dias (ou quase)
+        #    e lucrativos em >= min_consistency% deles
+        total_days = len(files)
+        consistent = []
+
+        for name, days in all_days.items():
+            # days contem os dias onde o setup teve trades e retornou resultado
+            # Se o setup nao operou num dia (zero trades?), o analyze nao o retorna? 
+            # Minha logica atual do analyze retorna apenas se len(closed) > 0.
+            # Entao dias sem trade contam como "nao lucrativo"?
+            # Pelo pedido: "presentes em todos os dias". 
+            # Mas se o setup é raro, pode nao dar entrada todo dia. 
+            # Vamos assumir que consistencia é sobre os dias analisados.
+
+            days_profitable = sum(1 for d in days if d["profitable"])
+            
+            # Consistencia baseada no TOTAL de arquivos enviados
+            # Se o setup nao apareceu no dia (0 trades), ele nao esta na lista 'days',
+            # entao conta como falha de consistencia (0 lucro).
+            consistency = days_profitable / total_days if total_days > 0 else 0
+
+            if consistency >= min_consistency:
+                avg_win_rate = sum(d["win_rate"] for d in days) / len(days)
+                total_profit = sum(d["profit"] for d in days)
+                
+                consistent.append({
+                    "setup_name": name,
+                    "stop_ticks": stop_ticks,
+                    "target_ticks": target_ticks,
+                    "days_tested": total_days,
+                    "days_profitable": days_profitable,
+                    "days_with_trades": len(days),
+                    "consistency": round(consistency, 2),
+                    "avg_win_rate": round(avg_win_rate, 1),
+                    "total_profit_usd": round(total_profit, 2),
+                    "avg_daily_profit_usd": round(total_profit / total_days, 2),
+                    "daily_results": days,
+                    # Adicionar regras para o frontend exibir detalhes
+                    # (Pegamos do primeiro dia onde apareceu, pois sao iguais)
+                    # "rules": ... (teria que guardar antes)
+                })
+
+        # Ordenar por consistência e lucro
+        consistent.sort(key=lambda x: (x["consistency"], x["total_profit_usd"]), reverse=True)
+
+        return {
+            "status": "completed",
+            "total_days": total_days,
+            "total_setups_tested": len(all_days),
+            "consistent_setups": consistent,
+        }
+
+    except Exception as e:
+        import traceback
+        return {"status": "error", "message": str(e), "detail": traceback.format_exc()}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
