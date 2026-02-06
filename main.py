@@ -1,5 +1,5 @@
-# main.py COMPLETO - TradeLog Analyzer API v3
-# Batch Analysis Robusta com Geração Dinâmica de Setups
+# main.py - TradeLog Analyzer API v4
+# Estratégias Direção-Neutras com Consistência Diária
 
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from itertools import combinations
 
-app = FastAPI(title="TradeLog Analyzer API")
+app = FastAPI(title="TradeLog Analyzer API v4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,284 +21,396 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class TradeAnalyzer:
-    def __init__(self, tick_value=0.50, tick_size=0.25):
-        self.tick_value = tick_value
-        self.tick_size = tick_size
+# ─── Constantes ───
+TICK_VALUE = 0.50
+TICK_SIZE = 0.25
+COMMISSION_RT = 1.04  # round-trip
+MAX_DAILY_LOSS_TICKS = 60
+MIN_RR_RATIO = 2.0
+MAX_BARS_IN_TRADE = 20
 
-    def parse_json_file(self, content: str) -> List[dict]:
-        content = re.sub(r'(?<=[\d])(,)(?=[\d])', '.', content)
-        try:
-            parsed = json.loads(content)
-            if isinstance(parsed, list):
-                return parsed
-            return [parsed]
-        except json.JSONDecodeError:
-            pass
 
-        lines = content.strip().split('\n\n')
-        data_list = []
-        for line in lines:
-            line = line.strip()
-            if line:
-                try:
-                    parsed = json.loads(line)
-                    if isinstance(parsed, list):
-                        data_list.extend(parsed)
-                    else:
-                        data_list.append(parsed)
-                except:
-                    continue
+# ═══════════════════════════════════════════════════
+# PARSER - converte JSON dos logs em DataFrame
+# ═══════════════════════════════════════════════════
 
-        if not data_list:
-            for line in content.strip().split('\n'):
-                line = line.strip()
-                if line:
-                    try:
-                        data_list.append(json.loads(line))
-                    except:
-                        continue
-        return data_list
-
-    def convert_to_dataframe(self, data_list: List[dict]) -> pd.DataFrame:
-        records = []
-        for item in data_list:
+def parse_json_content(content: str) -> List[dict]:
+    """Parse flexível: aceita array JSON, objetos separados por \\n\\n, ou NDJSON."""
+    content = re.sub(r'(?<=\d)(,)(?=\d)', '.', content)
+    
+    # Tenta array JSON direto
+    try:
+        parsed = json.loads(content)
+        return parsed if isinstance(parsed, list) else [parsed]
+    except json.JSONDecodeError:
+        pass
+    
+    # Tenta blocos separados por \n\n
+    data = []
+    for block in content.strip().split('\n\n'):
+        block = block.strip()
+        if block:
             try:
-                timestamp_str = item.get('timestamp_barra') or item.get('timestamp')
-                if not timestamp_str:
-                    continue
+                p = json.loads(block)
+                data.extend(p if isinstance(p, list) else [p])
+            except:
+                continue
+    
+    if data:
+        return data
+    
+    # Tenta NDJSON (uma linha por objeto)
+    for line in content.strip().split('\n'):
+        line = line.strip()
+        if line:
+            try:
+                data.append(json.loads(line))
+            except:
+                continue
+    return data
 
-                barra = item.get('barra', {})
-                indicadores = item.get('indicadores', {})
 
-                record = {
-                    'timestamp': pd.to_datetime(timestamp_str),
-                    'open': float(barra.get('open', 0)),
-                    'high': float(barra.get('high', 0)),
-                    'low': float(barra.get('low', 0)),
-                    'close': float(barra.get('close', 0)),
-                    'volume': int(barra.get('volume', 0)),
-                    'direcao': barra.get('direcao', ''),
-                }
-
-                # Extrair indicadores básicos para o DataFrame
-                if 'rsi' in indicadores:
-                    record['rsi'] = float(indicadores['rsi'].get('valor', 50))
-                else:
-                    record['rsi'] = 50
-
-                if 'ema' in indicadores:
-                    record['ema'] = float(indicadores['ema'].get('valor', 0))
-                    record['ema_dist_ticks'] = int(indicadores['ema'].get('distancia_close_ticks', 0))
-                else:
-                    record['ema'] = 0
-                    record['ema_dist_ticks'] = 0
-                
-                # Para close_vs_ema: se ema_dist_ticks > 0 (preço acima), < 0 (abaixo)
-                # Vamos simplificar: se ema_dist_ticks > 0 -> 1, se < 0 -> -1
-                record['close_vs_ema'] = 1 if record['ema_dist_ticks'] > 0 else -1
-
-                if 'fibonacci_pivots' in indicadores:
-                    fp = indicadores['fibonacci_pivots']
-                    record['pivot_zona'] = fp.get('zona', '')
-                else:
-                    record['pivot_zona'] = ''
-
-                records.append(record)
-            except Exception:
+def to_dataframe(entries: List[dict]) -> pd.DataFrame:
+    """Converte entradas do log em DataFrame com indicadores derivados."""
+    records = []
+    for item in entries:
+        try:
+            ts = item.get('timestamp_barra') or item.get('timestamp')
+            if not ts:
                 continue
 
-        if not records:
-             # Retorna DataFrame vazio se falhar
-            return pd.DataFrame()
+            barra = item.get('barra', {})
+            ind = item.get('indicadores', {})
 
-        df = pd.DataFrame(records)
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        return df
+            r = {
+                'timestamp': pd.to_datetime(ts),
+                'open': float(barra.get('open', 0)),
+                'high': float(barra.get('high', 0)),
+                'low': float(barra.get('low', 0)),
+                'close': float(barra.get('close', 0)),
+                'volume': int(barra.get('volume', ind.get('volume', {}).get('valor', 0))),
+                'direcao': barra.get('direcao', ''),
+            }
 
-    def backtest(self, df: pd.DataFrame, conditions: List[dict], stop_ticks: int, target_ticks: int) -> List[dict]:
-        """
-        Testa um setup específico (lista de condições) no DataFrame.
-        Retorna lista de trades.
-        """
-        # 1. Aplicar filtros dinâmicos
-        # Começa com tudo True
-        mask = pd.Series([True] * len(df))
+            # RSI
+            r['rsi'] = float(ind.get('rsi', {}).get('valor', 50))
 
-        for cond in conditions:
-            campo = cond['campo']
-            op = cond['operador']
-            val = cond['valor']
+            # EMA
+            ema_data = ind.get('ema', {})
+            r['ema'] = float(ema_data.get('valor', 0))
+            r['ema_dist'] = int(ema_data.get('distancia_close_ticks', 0))
 
-            if campo not in df.columns:
-                # Se campo não existe (ex: volume não parseado direito), falha seguro
-                mask = mask & False
-                continue
+            # Fibonacci Pivots
+            fp = ind.get('fibonacci_pivots', {})
+            r['pivot_pp'] = float(fp.get('pp', 0))
+            r['pivot_r1'] = float(fp.get('r1', 0))
+            r['pivot_s1'] = float(fp.get('s1', 0))
+            r['pivot_zona'] = fp.get('zona', '')
 
-            if op == '<':
-                mask = mask & (df[campo] < val)
-            elif op == '>':
-                mask = mask & (df[campo] > val)
-            elif op == '==':
-                mask = mask & (df[campo] == val)
-            elif op == '>=':
-                mask = mask & (df[campo] >= val)
-            elif op == '<=':
-                mask = mask & (df[campo] <= val)
+            # ATR se disponível
+            r['atr'] = float(ind.get('atr', {}).get('valor', 0))
 
-        # Índices onde todas as condições são atendidas
-        entry_indices = df[mask].index.tolist()
-        
-        # Se não houver sinais, retorna vazio
-        if not entry_indices:
-            return []
+            records.append(r)
+        except:
+            continue
 
-        # 2. Executar trades (Uma entrada por vez)
-        trades = []
-        max_bars = 20
-        next_allowed_bar = 0
+    if not records:
+        return pd.DataFrame()
 
-        # Para simplificar direção, vamos assumir direção baseada no 'direcao' do candle
-        # ou se o setup for apenas 'rsi < 30', assumimos LONG?
-        # A lógica do usuário pede para gerar setups. Se o setup tem "direcao == ALTA", é LONG.
-        # Se tem "direcao == BAIXA", é SHORT.
-        # Se não tiver direção explícita, idealmente ignoramos ou testamos ambos.
-        # Pelo gerador de setups, vamos incluir sempre uma condição de direção.
+    df = pd.DataFrame(records).sort_values('timestamp').reset_index(drop=True)
 
-        # Identificar direção do setup pelos filters
-        direction = 'LONG' # Default
-        for cond in conditions:
-            if cond['campo'] == 'direcao':
-                if cond['valor'].upper() == 'BAIXA':
-                    direction = 'SHORT'
-                break
-        
-        for idx in entry_indices:
-            if idx < next_allowed_bar:
-                continue
-            if idx + max_bars >= len(df):
-                continue
-            
-            entry_price = df.iloc[idx]['close']
-            
-            # Simulação Simples
-            profit = 0
-            bars = max_bars
-            
-            # Lógica de simulação (cópia simplificada do simulate_trade anterior)
-            if direction == 'LONG':
-                stop_price = entry_price - (stop_ticks * self.tick_size)
-                target_price = entry_price + (target_ticks * self.tick_size)
-                result_status = 'OPEN'
-                
-                for i in range(1, max_bars + 1):
-                    future = df.iloc[idx + i]
-                    if future['low'] <= stop_price:
-                        profit = -stop_ticks
-                        bars = i
-                        result_status = 'STOP'
-                        break
-                    elif future['high'] >= target_price:
-                        profit = target_ticks
-                        bars = i
-                        result_status = 'TARGET'
-                        break
-            else: # SHORT
-                stop_price = entry_price + (stop_ticks * self.tick_size)
-                target_price = entry_price - (target_ticks * self.tick_size)
-                result_status = 'OPEN'
+    # ─── Indicadores Derivados ───
+    # Candle body e range
+    df['body'] = abs(df['close'] - df['open'])
+    df['range'] = df['high'] - df['low']
+    df['body_ratio'] = np.where(df['range'] > 0, df['body'] / df['range'], 0)
 
-                for i in range(1, max_bars + 1):
-                    future = df.iloc[idx + i]
-                    if future['high'] >= stop_price:
-                        profit = -stop_ticks
-                        bars = i
-                        result_status = 'STOP'
-                        break
-                    elif future['low'] <= target_price:
-                        profit = target_ticks
-                        bars = i
-                        result_status = 'TARGET'
-                        break
-            
-            if result_status != 'OPEN':
-                trades.append({
-                    'profit': profit,
-                    'result': result_status,
-                    'bars': bars
-                })
-                # Pula barras até trade fechar
-                next_allowed_bar = idx + bars + 1
+    # Posição do close dentro do range (0=low, 1=high)
+    df['close_position'] = np.where(
+        df['range'] > 0,
+        (df['close'] - df['low']) / df['range'],
+        0.5
+    )
 
-        return trades
+    # Variação vs barra anterior
+    df['delta_close'] = df['close'].diff().fillna(0)
+    df['delta_close_ticks'] = (df['delta_close'] / TICK_SIZE).round().astype(int)
+
+    # RSI zones
+    df['rsi_zone'] = pd.cut(
+        df['rsi'],
+        bins=[0, 30, 40, 60, 70, 100],
+        labels=['oversold', 'weak', 'neutral', 'strong', 'overbought'],
+        include_lowest=True
+    ).astype(str)
+
+    # Preço vs EMA
+    df['above_ema'] = (df['close'] > df['ema']).astype(int)
+
+    # Preço vs Pivot
+    df['above_pp'] = np.where(df['pivot_pp'] > 0, (df['close'] > df['pivot_pp']).astype(int), -1)
+
+    # Sequência de barras na mesma direção
+    df['dir_num'] = np.where(df['direcao'] == 'ALTA', 1, np.where(df['direcao'] == 'BAIXA', -1, 0))
+    streak = []
+    current = 0
+    for d in df['dir_num']:
+        if d == 0:
+            current = 0
+        elif len(streak) == 0:
+            current = d
+        elif np.sign(d) == np.sign(current):
+            current += d
+        else:
+            current = d
+        streak.append(current)
+    df['dir_streak'] = streak
+
+    # Hora do dia (para janela operacional)
+    df['hour'] = df['timestamp'].dt.hour
+    df['minute'] = df['timestamp'].dt.hour * 60 + df['timestamp'].dt.minute
+
+    return df
 
 
-analyzer = TradeAnalyzer()
+# ═══════════════════════════════════════════════════
+# GERADOR DE SETUPS DIREÇÃO-NEUTROS
+# Cada setup gera sinais LONG e SHORT simetricamente
+# ═══════════════════════════════════════════════════
 
-
-def generate_all_setups():
+def generate_neutral_setups() -> List[dict]:
+    """
+    Gera setups que operam AMBAS as direções.
+    Cada setup define condição de contexto + gatilho direcional.
+    """
     setups = []
-    
-    rsi_conditions = [
-        {"campo": "rsi", "operador": "<", "valor": 25},
-        {"campo": "rsi", "operador": "<", "valor": 30},
-        {"campo": "rsi", "operador": "<", "valor": 35},
-        {"campo": "rsi", "operador": "<", "valor": 40},
-        {"campo": "rsi", "operador": ">", "valor": 55},
-        {"campo": "rsi", "operador": ">", "valor": 60},
-        {"campo": "rsi", "operador": ">", "valor": 65},
-        {"campo": "rsi", "operador": ">", "valor": 70},
-        {"campo": "rsi", "operador": ">", "valor": 75},
-    ]
-    
-    ema_conditions = [
-        {"campo": "close_vs_ema", "operador": "==", "valor": 1},
-        {"campo": "close_vs_ema", "operador": "==", "valor": -1},
-    ]
-    
-    ema_dist_conditions = [
-        {"campo": "ema_dist_ticks", "operador": ">", "valor": 5},
-        {"campo": "ema_dist_ticks", "operador": ">", "valor": 10},
-        {"campo": "ema_dist_ticks", "operador": "<", "valor": -5},
-        {"campo": "ema_dist_ticks", "operador": "<", "valor": -10},
-    ]
-    
-    dir_conditions = [
-        {"campo": "direcao", "operador": "==", "valor": "ALTA"},
-        {"campo": "direcao", "operador": "==", "valor": "BAIXA"},
-    ]
-    
-    # Combinar todos os filtros de indicadores
-    all_filters = rsi_conditions + ema_conditions + ema_dist_conditions
-    
     idx = 0
-    # setups com 1 indicador + direção (simples)
-    for direct in dir_conditions:
-        for f1 in all_filters:
-            idx += 1
-            # Ex: S1: A+rsi<30
-            setups.append({
-                "name": f"S{idx}:{direct['valor'][:1]}+{f1['campo']}{f1['operador']}{f1['valor']}",
-                "conditions": [direct, f1]
-            })
+
+    # ─── Condições de Contexto (direção-neutras) ───
+    context_conditions = [
+        # RSI em zona neutra (mercado sem tendência extrema)
+        {"name": "RSI_Neutro", "long": [{"campo": "rsi", "op": ">", "val": 35}, {"campo": "rsi", "op": "<", "val": 65}],
+         "short": [{"campo": "rsi", "op": ">", "val": 35}, {"campo": "rsi", "op": "<", "val": 65}]},
         
-        # setups com 2 indicadores + direção (combinados)
-        # Iterar para combinar f1 e f2 diferentes
-        for i, f1 in enumerate(all_filters):
-            for f2 in all_filters[i+1:]:
-                # Evitar conflito de mesmo campo (ex: rsi < 30 E rsi < 40 - redundante ou conflitante)
-                if f1['campo'] == f2['campo']:
-                    continue
-                
+        # RSI em extremos (reversão)
+        {"name": "RSI_Reversao",
+         "long": [{"campo": "rsi", "op": "<", "val": 35}],
+         "short": [{"campo": "rsi", "op": ">", "val": 65}]},
+        
+        {"name": "RSI_Reversao_Forte",
+         "long": [{"campo": "rsi", "op": "<", "val": 30}],
+         "short": [{"campo": "rsi", "op": ">", "val": 70}]},
+
+        # Sem filtro RSI
+        {"name": "Sem_RSI", "long": [], "short": []},
+    ]
+
+    # ─── Gatilhos Direcionais (simétricos) ───
+    directional_triggers = [
+        # Barra de reversão: barra anterior na direção oposta
+        {"name": "Barra_Reversao",
+         "long": [{"campo": "direcao", "op": "==", "val": "ALTA"}],
+         "short": [{"campo": "direcao", "op": "==", "val": "BAIXA"}]},
+
+        # Preço vs EMA
+        {"name": "Pullback_EMA",
+         "long": [{"campo": "above_ema", "op": "==", "val": 1}, {"campo": "ema_dist", "op": "<", "val": 5}],
+         "short": [{"campo": "above_ema", "op": "==", "val": 0}, {"campo": "ema_dist", "op": ">", "val": -5}]},
+
+        {"name": "Afastado_EMA",
+         "long": [{"campo": "ema_dist", "op": ">", "val": 8}],
+         "short": [{"campo": "ema_dist", "op": "<", "val": -8}]},
+
+        # Close position no candle
+        {"name": "Close_Forte",
+         "long": [{"campo": "close_position", "op": ">", "val": 0.7}],
+         "short": [{"campo": "close_position", "op": "<", "val": 0.3}]},
+
+        # Sequência direcional (momentum)
+        {"name": "Momentum_2bars",
+         "long": [{"campo": "dir_streak", "op": ">=", "val": 2}],
+         "short": [{"campo": "dir_streak", "op": "<=", "val": -2}]},
+
+        {"name": "Momentum_3bars",
+         "long": [{"campo": "dir_streak", "op": ">=", "val": 3}],
+         "short": [{"campo": "dir_streak", "op": "<=", "val": -3}]},
+
+        # Body ratio (candle cheio vs doji)
+        {"name": "Candle_Cheio",
+         "long": [{"campo": "body_ratio", "op": ">", "val": 0.6}, {"campo": "direcao", "op": "==", "val": "ALTA"}],
+         "short": [{"campo": "body_ratio", "op": ">", "val": 0.6}, {"campo": "direcao", "op": "==", "val": "BAIXA"}]},
+
+        # Delta grande (movimento forte)
+        {"name": "Delta_Forte",
+         "long": [{"campo": "delta_close_ticks", "op": ">", "val": 4}],
+         "short": [{"campo": "delta_close_ticks", "op": "<", "val": -4}]},
+    ]
+
+    # ─── Filtros de Preço vs Pivot ───
+    pivot_filters = [
+        {"name": "", "long": [], "short": []},  # sem filtro
+        {"name": "+PivotAbove",
+         "long": [{"campo": "above_pp", "op": "==", "val": 1}],
+         "short": [{"campo": "above_pp", "op": "==", "val": 0}]},
+    ]
+
+    # ─── Combinar: contexto × gatilho × pivot ───
+    for ctx in context_conditions:
+        for trig in directional_triggers:
+            for piv in pivot_filters:
                 idx += 1
+                name = f"{ctx['name']}_{trig['name']}{piv['name']}"
+
+                long_conds = ctx['long'] + trig['long'] + piv['long']
+                short_conds = ctx['short'] + trig['short'] + piv['short']
+
                 setups.append({
-                    "name": f"S{idx}:{direct['valor'][:1]}+{f1['campo']}+{f2['campo']}",
-                    "conditions": [direct, f1, f2]
+                    "name": name,
+                    "long_conditions": long_conds,
+                    "short_conditions": short_conds,
                 })
 
-    print(f"[BATCH] Gerados {len(setups)} setups dinâmicos")
     return setups
 
+
+# ═══════════════════════════════════════════════════
+# BACKTESTER com controle de risco diário
+# ═══════════════════════════════════════════════════
+
+def apply_conditions(df: pd.DataFrame, conditions: List[dict]) -> pd.Series:
+    """Retorna máscara booleana onde TODAS as condições são atendidas."""
+    mask = pd.Series(True, index=df.index)
+    for c in conditions:
+        campo = c['campo']
+        op = c['op']
+        val = c['val']
+        if campo not in df.columns:
+            return pd.Series(False, index=df.index)
+        
+        col = df[campo]
+        if op == '<': mask &= (col < val)
+        elif op == '>': mask &= (col > val)
+        elif op == '==': mask &= (col == val)
+        elif op == '>=': mask &= (col >= val)
+        elif op == '<=': mask &= (col <= val)
+    return mask
+
+
+def backtest_neutral(
+    df: pd.DataFrame,
+    long_conditions: List[dict],
+    short_conditions: List[dict],
+    stop_ticks: int,
+    target_ticks: int,
+) -> List[dict]:
+    """
+    Backtest direção-neutra com max loss diário de 60 ticks.
+    Retorna lista de trades com direção, resultado, etc.
+    """
+    long_mask = apply_conditions(df, long_conditions)
+    short_mask = apply_conditions(df, short_conditions)
+
+    trades = []
+    next_allowed = 0
+    daily_loss_ticks = 0
+
+    for i in range(len(df) - MAX_BARS_IN_TRADE):
+        if i < next_allowed:
+            continue
+
+        # Checar se estourou loss diário
+        if daily_loss_ticks >= MAX_DAILY_LOSS_TICKS:
+            break
+
+        direction = None
+        if long_mask.iloc[i]:
+            direction = 'LONG'
+        elif short_mask.iloc[i]:
+            direction = 'SHORT'
+        else:
+            continue
+
+        entry_price = df.iloc[i]['close']
+        entry_time = df.iloc[i]['timestamp']
+
+        if direction == 'LONG':
+            stop_price = entry_price - (stop_ticks * TICK_SIZE)
+            target_price = entry_price + (target_ticks * TICK_SIZE)
+        else:
+            stop_price = entry_price + (stop_ticks * TICK_SIZE)
+            target_price = entry_price - (target_ticks * TICK_SIZE)
+
+        result = None
+        exit_price = entry_price
+        exit_time = entry_time
+        bars = 0
+
+        for j in range(1, MAX_BARS_IN_TRADE + 1):
+            bar = df.iloc[i + j]
+            if direction == 'LONG':
+                if bar['low'] <= stop_price:
+                    result = 'STOP'
+                    exit_price = stop_price
+                    bars = j
+                    break
+                elif bar['high'] >= target_price:
+                    result = 'TARGET'
+                    exit_price = target_price
+                    bars = j
+                    break
+            else:
+                if bar['high'] >= stop_price:
+                    result = 'STOP'
+                    exit_price = stop_price
+                    bars = j
+                    break
+                elif bar['low'] <= target_price:
+                    result = 'TARGET'
+                    exit_price = target_price
+                    bars = j
+                    break
+
+        if result is None:
+            # Timeout - fecha no close da última barra
+            result = 'TIMEOUT'
+            exit_price = df.iloc[i + MAX_BARS_IN_TRADE]['close']
+            bars = MAX_BARS_IN_TRADE
+            profit_ticks = int(round((exit_price - entry_price) / TICK_SIZE)) if direction == 'LONG' \
+                else int(round((entry_price - exit_price) / TICK_SIZE))
+        else:
+            profit_ticks = target_ticks if result == 'TARGET' else -stop_ticks
+
+        # Atualizar loss diário
+        if profit_ticks < 0:
+            daily_loss_ticks += abs(profit_ticks)
+
+        # Checar se próximo trade estouraria o limite
+        if daily_loss_ticks >= MAX_DAILY_LOSS_TICKS and profit_ticks < 0:
+            # Registra o trade mas para depois
+            pass
+
+        profit_usd = (profit_ticks * TICK_VALUE) - COMMISSION_RT
+
+        trades.append({
+            'direction': direction,
+            'result': result,
+            'profit_ticks': profit_ticks,
+            'profit_usd': round(profit_usd, 2),
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'entry_time': str(entry_time),
+            'exit_time': str(df.iloc[i + bars]['timestamp']),
+            'bars': bars,
+        })
+
+        next_allowed = i + bars + 1
+
+    return trades
+
+
+# ═══════════════════════════════════════════════════
+# ANÁLISE EM LOTE - Encontra as TOP 3 estratégias
+# ═══════════════════════════════════════════════════
 
 @app.post("/api/v1/analyze-batch")
 async def analyze_batch(
@@ -306,220 +418,281 @@ async def analyze_batch(
     config: str = Form('{}')
 ):
     try:
-        try:
-            cfg = json.loads(config)
-        except:
-            cfg = {}
-            
-        min_consistency = cfg.get('minConsistency', 0.9)
-        min_wr = cfg.get('minWinRate', 60)
-        
-        # 1. Parsear todos os arquivos e converter para DataFrames EM MEMÓRIA
-        all_days_data = {} # filename -> DataFrame
-        
-        for f in files:
-            content = await f.read()
-            filename = f.filename
-            content_str = content.decode('utf-8')
-            entries = analyzer.parse_json_file(content_str)
-            if entries:
-                df = analyzer.convert_to_dataframe(entries)
-                if not df.empty:
-                    all_days_data[filename] = df
+        cfg = json.loads(config) if config else {}
+    except:
+        cfg = {}
 
-        if not all_days_data:
-            return {
-                "status": "completed", 
-                "total_days": 0,
-                "total_setups_tested": 0, 
-                "consistent_setups": []
-            }
+    min_wr = cfg.get('minWinRate', 55)
 
-        # 2. Gerar setups dinâmicos
-        setups = generate_all_setups()
-        
-        # 3. Testar CADA setup em CADA dia com MÚLTIPLOS stops/targets
-        possible_stops = [10, 15, 20]
-        possible_targets = [20, 30, 40]
-        
-        # Dicionário para agregar resultados: Key -> {setup, stop, target, daily_stats: []}
-        aggregated_results = {}
-        
-        # Para otimizar, iteramos setups e dias
-        for setup in setups:
-            for stop in possible_stops:
-                for target in possible_targets:
-                    # Chave única do teste
-                    test_key = f"{setup['name']}|{stop}|{target}"
-                    
-                    daily_stats = []
-                    
-                    for day_name, df in all_days_data.items():
-                        trades = analyzer.backtest(df, setup['conditions'], stop, target)
-                        
-                        count = len(trades)
-                        profit = sum(t['profit'] for t in trades)
-                        profit_usd = profit * analyzer.tick_value
-                        wins = sum(1 for t in trades if t['result'] == 'TARGET')
-                        wr = (wins / count * 100) if count > 0 else 0
-                        
-                        daily_stats.append({
-                            "day": day_name,
-                            "total_trades": count,
-                            "profit": profit_usd,
-                            "win_rate": wr,
-                            "profitable": profit_usd > 0
-                        })
-                    
-                    aggregated_results[test_key] = {
-                        "setup": setup,
-                        "stop": stop,
-                        "target": target,
-                        "daily_stats": daily_stats
-                    }
+    # 1. Parse todos os dias
+    days_data: Dict[str, pd.DataFrame] = {}
+    for f in files:
+        content = (await f.read()).decode('utf-8')
+        entries = parse_json_content(content)
+        if entries:
+            df = to_dataframe(entries)
+            if not df.empty:
+                days_data[f.filename] = df
 
-        # 4. Calcular métricas para TODOS os resultados
-        all_results_list = []
-        
-        for key, data in aggregated_results.items():
-            stats = data['daily_stats']
-            active_days = [d for d in stats if d['total_trades'] > 0]
-            
-            if not active_days or len(active_days) < 2:
+    if not days_data:
+        return {"status": "completed", "total_days": 0, "total_setups_tested": 0, "consistent_setups": []}
+
+    total_days = len(days_data)
+
+    # 2. Gerar setups neutros
+    setups = generate_neutral_setups()
+
+    # 3. Stops e targets com RR >= 2:1
+    stop_target_combos = []
+    for stop in [8, 10, 12, 15, 20]:
+        for rr in [2.0, 2.5, 3.0]:
+            target = int(stop * rr)
+            stop_target_combos.append((stop, target))
+
+    # 4. Testar cada setup × stop/target em cada dia
+    all_results = []
+
+    for setup in setups:
+        for stop, target in stop_target_combos:
+            daily_stats = []
+            total_longs = 0
+            total_shorts = 0
+            all_trades_combined = []
+
+            for day_name, df in days_data.items():
+                trades = backtest_neutral(
+                    df, setup['long_conditions'], setup['short_conditions'],
+                    stop, target
+                )
+
+                count = len(trades)
+                if count == 0:
+                    daily_stats.append({
+                        "day": day_name,
+                        "total_trades": 0,
+                        "longs": 0,
+                        "shorts": 0,
+                        "profit": 0,
+                        "win_rate": 0,
+                        "profitable": False,
+                    })
+                    continue
+
+                wins = sum(1 for t in trades if t['profit_ticks'] > 0)
+                profit_usd = sum(t['profit_usd'] for t in trades)
+                longs = sum(1 for t in trades if t['direction'] == 'LONG')
+                shorts = sum(1 for t in trades if t['direction'] == 'SHORT')
+                wr = (wins / count * 100) if count > 0 else 0
+
+                total_longs += longs
+                total_shorts += shorts
+                all_trades_combined.extend(trades)
+
+                daily_stats.append({
+                    "day": day_name,
+                    "total_trades": count,
+                    "longs": longs,
+                    "shorts": shorts,
+                    "profit": round(profit_usd, 2),
+                    "win_rate": round(wr, 1),
+                    "profitable": profit_usd > 0,
+                })
+
+            # ─── Filtros de Qualidade ───
+            active_days = [d for d in daily_stats if d['total_trades'] > 0]
+
+            # REGRA 1: Deve ter trade TODOS os dias
+            if len(active_days) < total_days:
                 continue
-                
-            num_active = len(active_days)
-            num_profitable = sum(1 for d in active_days if d['profitable'])
-            consistency = num_profitable / num_active
-            avg_wr = sum(d['win_rate'] for d in active_days) / num_active
+
+            # REGRA 2: Equilíbrio direcional (mín 30% de cada lado)
+            total_trades_all = total_longs + total_shorts
+            if total_trades_all == 0:
+                continue
+            long_ratio = total_longs / total_trades_all
+            if long_ratio < 0.30 or long_ratio > 0.70:
+                continue
+
+            # REGRA 3: Consistência (dias lucrativos)
+            profitable_days = sum(1 for d in active_days if d['profitable'])
+            consistency = profitable_days / len(active_days)
+
+            # REGRA 4: Win rate médio
+            avg_wr = sum(d['win_rate'] for d in active_days) / len(active_days)
+            if avg_wr < min_wr:
+                continue
+
+            # Calcular métricas agregadas
             total_profit = sum(d['profit'] for d in active_days)
-            
-            # Calcular profit factor
-            gross_profit = sum(d['profit'] for d in active_days if d['profit'] > 0)
-            gross_loss = abs(sum(d['profit'] for d in active_days if d['profit'] < 0))
-            pf = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 99.0
-            
-            entry = {
-                "setup_name": data['setup']['name'],
-                "stop_ticks": data['stop'],
-                "target_ticks": data['target'],
-                "days_tested": len(all_days_data),
-                "days_with_trades": num_active,
-                "days_profitable": num_profitable,
+            gross_profit = sum(t['profit_usd'] for t in all_trades_combined if t['profit_usd'] > 0)
+            gross_loss = abs(sum(t['profit_usd'] for t in all_trades_combined if t['profit_usd'] < 0))
+            profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else 999
+
+            # Últimos 5 trades como amostra
+            sample = all_trades_combined[-5:] if all_trades_combined else []
+
+            all_results.append({
+                "setup_name": setup['name'],
+                "stop_ticks": stop,
+                "target_ticks": target,
+                "days_tested": total_days,
+                "days_profitable": profitable_days,
                 "consistency": round(consistency, 2),
                 "avg_win_rate": round(avg_wr, 1),
-                "avg_profit_factor": pf,
+                "avg_profit_factor": profit_factor,
                 "total_profit_usd": round(total_profit, 2),
-                "avg_daily_profit_usd": round(total_profit / num_active, 2),
+                "avg_daily_profit_usd": round(total_profit / len(active_days), 2),
+                "total_trades": total_trades_all,
+                "total_longs": total_longs,
+                "total_shorts": total_shorts,
+                "long_ratio": round(long_ratio, 2),
                 "daily_results": active_days,
-                "rules": {"conditions": data['setup']['conditions']}
-            }
-            all_results_list.append(entry)
+                "rules": {
+                    "entry_long": setup['long_conditions'],
+                    "entry_short": setup['short_conditions'],
+                },
+                "rules_exit": {
+                    "tipo": "stop_target",
+                    "stop_ticks": stop,
+                    "target_ticks": target,
+                    "stop_usd": round(stop * TICK_VALUE + COMMISSION_RT, 2),
+                    "target_usd": round(target * TICK_VALUE - COMMISSION_RT, 2),
+                    "max_bars": MAX_BARS_IN_TRADE,
+                    "max_daily_loss_ticks": MAX_DAILY_LOSS_TICKS,
+                    "rr_ratio": round(target / stop, 1),
+                    "descricao": f"Stop {stop}t / Target {target}t (RR {round(target/stop,1)}:1) | Max loss diário: {MAX_DAILY_LOSS_TICKS}t"
+                },
+                "sample_trades": [
+                    {
+                        "tipo": t['direction'],
+                        "result": t['result'],
+                        "profit_ticks": t['profit_ticks'],
+                        "entry_price": t['entry_price'],
+                        "exit_price": t['exit_price'],
+                        "entry_time": t['entry_time'],
+                        "exit_time": t['exit_time'],
+                        "bars": t['bars'],
+                    }
+                    for t in sample
+                ],
+            })
 
-        # Separar consistentes
-        consistent = [r for r in all_results_list if r['consistency'] >= min_consistency and r['avg_win_rate'] >= min_wr]
-        consistent.sort(key=lambda x: x['total_profit_usd'], reverse=True)
-        
-        # Top 100 de TODOS (ordenados por consistência)
-        all_sorted = sorted(all_results_list, key=lambda x: x['consistency'], reverse=True)
-        
-        print(f"[BATCH] {len(all_results_list)} testados, {len(consistent)} consistentes")
-        
-        return {
-            "status": "completed",
-            "total_days": len(all_days_data),
-            "total_setups_tested": len(aggregated_results),
-            "consistent_setups": consistent[:50],
-            "all_setups": all_sorted[:100]
-        }
+    # 5. Ranquear: prioridade = consistência, depois profit
+    all_results.sort(key=lambda x: (x['consistency'], x['total_profit_usd']), reverse=True)
 
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc())
-        return {"status": "error", "message": str(e), "detail": traceback.format_exc()}
+    # Top 3 consistentes (≥90%) + all_setups para exploração
+    consistent = [r for r in all_results if r['consistency'] >= 0.9][:3]
 
+    return {
+        "status": "completed",
+        "total_days": total_days,
+        "total_setups_tested": len(setups) * len(stop_target_combos),
+        "consistent_setups": consistent,
+        "all_setups": all_results[:50],  # Top 50 para exploração
+    }
+
+
+# ═══════════════════════════════════════════════════
+# ENDPOINTS AUXILIARES
+# ═══════════════════════════════════════════════════
 
 @app.get("/")
 def home():
-    return {"message": "TradeLog Analyzer API v3", "status": "online"}
+    return {"message": "TradeLog Analyzer API v4", "status": "online"}
+
 
 @app.get("/api/v1/health")
-def health_check():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}  
+def health():
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
 
 @app.post("/api/v1/analyze")
-async def analyze_file(
-    file: UploadFile = File(...),
-    config: str = Form('{"minWinRate": 70}')
-):
+async def analyze_file(file: UploadFile = File(...), config: str = Form('{}')):
+    """Análise individual - mantida para compatibilidade."""
     try:
-        contents = await file.read()
-        content_str = contents.decode('utf-8')
+        cfg = json.loads(config) if config else {}
+    except:
+        cfg = {}
 
-        try:
-            config_dict = json.loads(config)
-        except:
-            config_dict = {"minWinRate": 70}
-            
-        # Para análise individual, vamos usar a mesma lógica do batch mas para 1 arquivo/setup?
-        # A API v2 usava 'analyzer.analyze(df, config)'. 
-        # Precisamos restaurar esse método na classe OU reimplementá-lo aqui.
-        # Como removemos o método 'analyze' da classe TradeAnalyzer no passo anterior, 
-        # precisamos reimplementá-lo ou adaptar.
-        
-        # Vamos fazer uma implementação rápida compatível usando a geração dinâmica:
-        data_list = analyzer.parse_json_file(content_str)
-        if not data_list:
-            return {"status": "error", "message": "Nenhum dado JSON válido encontrado"}
+    content = (await file.read()).decode('utf-8')
+    entries = parse_json_content(content)
+    if not entries:
+        return {"status": "error", "message": "Nenhum dado encontrado no arquivo"}
 
-        df = analyzer.convert_to_dataframe(data_list)
-        if len(df) == 0:
-            return {"status": "error", "message": "Nenhum dado válido após conversão"}
-            
-        # Gerar setups e testar (versão simplificada para 1 arquivo)
-        setups = generate_all_setups()
-        min_win_rate = config_dict.get('minWinRate', 70)
-        
-        results = []
-        # Testar apenas configurações padrão ou as solicitadas?
-        # Vamos testar o padrão do batch para consistência
-        user_stop = config_dict.get('stopTicks', 20)
-        user_target = config_dict.get('targetTicks', 40)
-        
-        # Se for só analisar o arquivo, podemos testar um config fixo ou varrer.
-        # Para ser rápido, vamos testar só o solicitado pelo usuário se existir, senão varrer.
-        
-        stop = user_stop
-        target = user_target
-        
-        for setup in setups:
-             trades = analyzer.backtest(df, setup['conditions'], stop, target)
-             if not trades: continue
-             
-             closed = [t for t in trades if t['result'] != 'OPEN']
-             if not closed: continue
-             
-             wins = len([t for t in closed if t['result'] == 'TARGET'])
-             wr = (wins / len(closed)) * 100
-             
-             if wr >= min_win_rate:
-                 total_profit = sum(t['profit'] for t in closed)
-                 results.append({
-                     'setup_name': setup['name'],
-                     'stop_ticks': stop,
-                     'target_ticks': target,
-                     'total_trades': len(closed),
-                     'win_rate': round(wr, 1),
-                     'net_profit_usd': round(total_profit * analyzer.tick_value, 2),
-                     'rules': {'conditions': setup['conditions']}
-                 })
-                 
-        results.sort(key=lambda x: x['win_rate'], reverse=True)
-        return {"status": "completed", "filename": file.filename, "results": results[:50]}
+    df = to_dataframe(entries)
+    if df.empty:
+        return {"status": "error", "message": "Não foi possível converter os dados"}
 
-    except Exception as e:
-        import traceback
-        return {"status": "error", "message": str(e), "detail": traceback.format_exc()}
+    stop = cfg.get('stopTicks', 20)
+    target = cfg.get('targetTicks', 40)
+    min_wr = cfg.get('minWinRate', 60)
+
+    setups = generate_neutral_setups()
+    results = []
+
+    for setup in setups:
+        trades = backtest_neutral(df, setup['long_conditions'], setup['short_conditions'], stop, target)
+        if not trades:
+            continue
+
+        wins = sum(1 for t in trades if t['profit_ticks'] > 0)
+        wr = (wins / len(trades)) * 100
+        if wr < min_wr:
+            continue
+
+        profit = sum(t['profit_usd'] for t in trades)
+        gp = sum(t['profit_usd'] for t in trades if t['profit_usd'] > 0)
+        gl = abs(sum(t['profit_usd'] for t in trades if t['profit_usd'] < 0))
+
+        results.append({
+            "setup_name": setup['name'],
+            "stop_ticks": stop,
+            "target_ticks": target,
+            "win_rate": round(wr, 1),
+            "profit_factor": round(gp / gl, 2) if gl > 0 else 999,
+            "net_profit_usd": round(profit, 2),
+            "total_trades": len(trades),
+            "wins": wins,
+            "losses": len(trades) - wins,
+            "rules": {
+                "entry_long": setup['long_conditions'],
+                "entry_short": setup['short_conditions'],
+            },
+            "rules_exit": {
+                "tipo": "stop_target",
+                "stop_ticks": stop,
+                "target_ticks": target,
+                "stop_usd": round(stop * TICK_VALUE + COMMISSION_RT, 2),
+                "target_usd": round(target * TICK_VALUE - COMMISSION_RT, 2),
+                "max_bars": MAX_BARS_IN_TRADE,
+                "descricao": f"Stop {stop}t / Target {target}t",
+            },
+            "sample_trades": [
+                {
+                    "tipo": t['direction'],
+                    "result": t['result'],
+                    "profit_ticks": t['profit_ticks'],
+                    "entry_price": t['entry_price'],
+                    "exit_price": t['exit_price'],
+                    "entry_time": t['entry_time'],
+                    "exit_time": t['exit_time'],
+                    "bars": t['bars'],
+                }
+                for t in trades[-5:]
+            ],
+        })
+
+    results.sort(key=lambda x: x['net_profit_usd'], reverse=True)
+
+    return {
+        "status": "completed",
+        "filename": file.filename,
+        "results": {
+            "total_setups_tested": len(setups),
+            "profitable_setups": len(results),
+            "best_setups": results[:20],
+        },
+    }
 
 
 if __name__ == "__main__":
